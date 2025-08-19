@@ -1,0 +1,224 @@
+# Azure DevOps Pipeline for Dev to Stage Deployment
+# File: azure-pipelines.yml
+
+trigger: none # Disable automatic triggers since we're using ServiceNow
+
+pr: none # Disable PR triggers
+
+# Pipeline will be triggered via REST API from ServiceNow
+variables:
+  # GitHub repository variables
+  - name: githubConnection
+    value: 'github-connection' # Service connection name in Azure DevOps
+  - name: repositoryName
+    value: 'your-org/your-repo' # Replace with your GitHub repo
+  - name: devBranch
+    value: 'dev'
+  - name: stageBranch
+    value: 'stage'
+  
+  # Python variables
+  - name: pythonVersion
+    value: '3.9'
+  - name: vmImageName
+    value: 'ubuntu-latest'
+
+  # ServiceNow variables (stored as pipeline variables/secrets)
+  - name: serviceNowInstance
+    value: 'your-instance.service-now.com'
+
+pool:
+  vmImage: $(vmImageName)
+
+stages:
+- stage: ValidateAndTest
+  displayName: 'Validate and Test Dev Branch'
+  jobs:
+  - job: ValidateCode
+    displayName: 'Code Validation and Testing'
+    steps:
+    - checkout: none
+    
+    # Checkout dev branch from GitHub
+    - task: GitHubRelease@1
+      displayName: 'Checkout Dev Branch'
+      inputs:
+        gitHubConnection: $(githubConnection)
+        repositoryName: $(repositoryName)
+        action: 'create'
+        target: $(devBranch)
+    
+    - script: |
+        git clone https://github.com/$(repositoryName).git .
+        git checkout $(devBranch)
+      displayName: 'Clone and Checkout Dev Branch'
+    
+    # Set up Python environment
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '$(pythonVersion)'
+        displayName: 'Use Python $(pythonVersion)'
+    
+    # Install dependencies
+    - script: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-cov flake8 black
+      displayName: 'Install Dependencies'
+    
+    # Code quality checks
+    - script: |
+        # Format check
+        black --check .
+        # Linting
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        # Type checking (if using type hints)
+        # mypy . --ignore-missing-imports
+      displayName: 'Code Quality Checks'
+      continueOnError: false
+    
+    # Run tests
+    - script: |
+        pytest tests/ --junitxml=junit/test-results.xml --cov=. --cov-report=xml
+      displayName: 'Run Tests'
+    
+    # Publish test results
+    - task: PublishTestResults@2
+      condition: succeededOrFailed()
+      inputs:
+        testResultsFiles: '**/test-*.xml'
+        testRunTitle: 'Publish test results for Python $(pythonVersion)'
+    
+    # Publish code coverage results
+    - task: PublishCodeCoverageResults@1
+      inputs:
+        codeCoverageTool: Cobertura
+        summaryFileLocation: '$(System.DefaultWorkingDirectory)/**/coverage.xml'
+
+- stage: MergeToStage
+  displayName: 'Merge Dev to Stage'
+  dependsOn: ValidateAndTest
+  condition: succeeded()
+  jobs:
+  - job: MergeBranches
+    displayName: 'Merge Dev to Stage Branch'
+    steps:
+    - checkout: none
+    
+    # Configure Git
+    - script: |
+        git config --global user.email "azure-devops@company.com"
+        git config --global user.name "Azure DevOps"
+      displayName: 'Configure Git'
+    
+    # Clone repository and perform merge
+    - script: |
+        # Clone the repository
+        git clone https://$(githubToken)@github.com/$(repositoryName).git .
+        
+        # Fetch all branches
+        git fetch --all
+        
+        # Checkout stage branch
+        git checkout $(stageBranch)
+        
+        # Merge dev into stage
+        git merge origin/$(devBranch) --no-ff -m "Automated merge from $(devBranch) to $(stageBranch) - ServiceNow Change: $(SERVICENOW_CHANGE_NUMBER)"
+        
+        # Push changes
+        git push origin $(stageBranch)
+      displayName: 'Merge Dev to Stage'
+      env:
+        githubToken: $(GITHUB_TOKEN) # Secure variable
+        SERVICENOW_CHANGE_NUMBER: $(CHANGE_REQUEST_NUMBER) # Passed from ServiceNow
+    
+    # Update ServiceNow with merge status
+    - task: PowerShell@2
+      displayName: 'Update ServiceNow Change Request'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $headers = @{
+            'Content-Type' = 'application/json'
+            'Authorization' = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$(SERVICENOW_USER):$(SERVICENOW_PASSWORD)"))
+          }
+          
+          $body = @{
+            'state' = '3' # In Progress or appropriate state
+            'work_notes' = "Code successfully merged from dev to stage branch. Pipeline executed at $(Get-Date)"
+          } | ConvertTo-Json
+          
+          $uri = "https://$(serviceNowInstance)/api/now/table/change_request/$(CHANGE_REQUEST_SYS_ID)"
+          
+          try {
+            Invoke-RestMethod -Uri $uri -Method PATCH -Headers $headers -Body $body
+            Write-Host "ServiceNow updated successfully"
+          } catch {
+            Write-Error "Failed to update ServiceNow: $($_.Exception.Message)"
+            exit 1
+          }
+
+- stage: DeployToStage
+  displayName: 'Deploy to Stage Environment'
+  dependsOn: MergeToStage
+  condition: succeeded()
+  jobs:
+  - deployment: DeployStage
+    displayName: 'Deploy to Stage Environment'
+    environment: 'stage' # Azure DevOps environment
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: none
+          
+          - script: |
+              git clone https://$(githubToken)@github.com/$(repositoryName).git .
+              git checkout $(stageBranch)
+            displayName: 'Checkout Stage Branch'
+            env:
+              githubToken: $(GITHUB_TOKEN)
+          
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '$(pythonVersion)'
+              displayName: 'Use Python $(pythonVersion)'
+          
+          - script: |
+              python -m pip install --upgrade pip
+              pip install -r requirements.txt
+            displayName: 'Install Dependencies'
+          
+          # Add your deployment steps here
+          # This could be deploying to Azure App Service, Container Registry, etc.
+          - script: |
+              echo "Deploying application to stage environment..."
+              # Add actual deployment commands here
+              # e.g., az webapp deployment source config-zip
+              # or docker build and push commands
+            displayName: 'Deploy Application'
+          
+          # Final ServiceNow update
+          - task: PowerShell@2
+            displayName: 'Update ServiceNow - Deployment Complete'
+            inputs:
+              targetType: 'inline'
+              script: |
+                $headers = @{
+                  'Content-Type' = 'application/json'
+                  'Authorization' = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$(SERVICENOW_USER):$(SERVICENOW_PASSWORD)"))
+                }
+                
+                $body = @{
+                  'state' = '0' # Completed successfully
+                  'work_notes' = "Deployment to stage environment completed successfully at $(Get-Date)"
+                } | ConvertTo-Json
+                
+                $uri = "https://$(serviceNowInstance)/api/now/table/change_request/$(CHANGE_REQUEST_SYS_ID)"
+                
+                try {
+                  Invoke-RestMethod -Uri $uri -Method PATCH -Headers $headers -Body $body
+                  Write-Host "ServiceNow updated - Change Request completed"
+                } catch {
+                  Write-Error "Failed to update ServiceNow: $($_.Exception.Message)"
+                }
