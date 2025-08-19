@@ -11,7 +11,7 @@ variables:
   - name: githubConnection
     value: 'github-connection' # Service connection name in Azure DevOps
   - name: repositoryName
-    value: 'your-org/your-repo' # Replace with your GitHub repo
+    value: 'testlabscyntra/testCI-CD' # Replace with your GitHub repo
   - name: devBranch
     value: 'dev'
   - name: stageBranch
@@ -25,7 +25,7 @@ variables:
 
   # ServiceNow variables (stored as pipeline variables/secrets)
   - name: serviceNowInstance
-    value: 'your-instance.service-now.com'
+    value: 'dev195428.service-now.com'
 
 pool:
   vmImage: $(vmImageName)
